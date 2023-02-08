@@ -1,0 +1,1412 @@
+VERSION 1.0 CLASS
+BEGIN
+  MultiUse = -1  'True
+END
+Attribute VB_Name = "clsSQL"
+Attribute VB_GlobalNameSpace = False
+Attribute VB_Creatable = False
+Attribute VB_PredeclaredId = False
+Attribute VB_Exposed = False
+'///------------------------------------------------------------------
+'///   Class:          clsSQL
+'///   Description:    Wrapper Class for SQL (ADO) Connections
+'///   Author:         Jason Mitchell                  Date: 26/04/17
+'///   Notes:          Todo: Needs to be fully tested with access
+'///
+'///   Revision History:
+'///   Name:           Date:        Description:
+'///   Jason Mitchell       26/04/17            Initial Release
+'///------------------------------------------------------------------
+
+'///------------------------------------------------------------------
+'///    Basic Usage
+'///------------------------------------------------------------------
+'///
+'///    dim tmpData as Object
+'///    Set sql = New clsSQL
+'///
+'///    sql.AutoBracket = True              'Turn Auto Bracketing on/off
+'///    sql.AutoQuote = True                'Turn Auto Quoting on/off
+'///    sql.SQLType = SQL_TYPE_ANSI         'ANSI (SQL)or ACCESS (MsAccess 2000+)
+'///    sql.Connect "Server", "Database", Optional UserName, OPtional Password     'Connect to the database. If UserName/Password is not set assumes a trusted connection
+'///    sql.StatementType = TYPE_UPDATE     'Type of statement being performed
+'///    sql.AddField "Field1", "Table1"     'add fields, include optional table name if using joins
+'///    sql.AddField "Field2", "Table1"     ' For single table queries used Addfields to add multiple fields in single call
+'///    sql.AddField "Field3", "Table1"
+'///    sql.AddField "Field1", "Table2"
+'///    sql.AddField "Field2", "Table2"
+'///    sql.AddField "Field3", "Table2"
+'///    sql.AddValue "Value1"               ' Add Values in the same order as fields
+'///    sql.AddValue "Value2"               ' For single table queries used AddValues to add multiple values in single call
+'///    sql.AddValue "Value3"
+'///    sql.AddValue "Value4"
+'///    sql.AddValue "Value5"
+'///    sql.AddValue "Value6"
+'///    sql.SetupJoin "Table1", "Field1", "Table2", "Field2", CLAUSE_EQUALS, INNER_JOIN             'set Joins
+'///    sql.AddWhereClause "Field1", "Value", "Table 2", "ByVal Value As Variant, CLAUSE_EQUALS     'set any where clauses"
+'///    sql.Make Statement                  'prepare the statement for execution
+'///    sql.Execute
+'///
+'///
+'///    Set tmpData = rst                   'return recordset if SELECT Query
+'///
+'///------------------------------------------------------------------
+
+
+
+Option Compare Text
+Option Explicit
+
+#If False Then
+    Private Const sqlDateAndTime = 0
+    Private Const sqlDateOnly = 1
+    Private Const sqlTimeOnly = 2
+#End If
+
+Public Enum SQLDateTypes
+    sqlDateAndTime
+    sqlDateOnly
+    sqlTimeOnly
+    sqlXMLDateAndTime
+End Enum
+
+Public Enum JOIN_TYPE
+    INNER_JOIN = 1
+    LEFT_JOIN = 2
+    RIGHT_JOIN = 3
+    FULL_JOIN = 4 'SUPPORTED BY SQL SERVER ONLY
+End Enum
+
+Public Enum CLAUSE_OPERATOR
+    CLAUSE_EQUALS
+    CLAUSE_LIKE
+    CLAUSE_GREATERTHAN
+    CLAUSE_LESSTHAN
+    CLAUSE_GREATERTHANOREQUAL
+    CLAUSE_LESSTHANOREQUAL
+    CLAUSE_DOESNOTEQUAL
+    CLAUSE_STARTWITH
+    CLAUSE_ENDWITH
+End Enum
+
+Public Enum WHERE_CLAUSE_LOGIC
+    LOGIC_AND
+    LOGIC_OR
+End Enum
+
+Public Enum STATEMENT_TYPE
+    TYPE_SELECT
+    TYPE_INSERT
+    TYPE_UPDATE
+    TYPE_DELETE
+End Enum
+
+Public Enum SQL_TYPE
+    SQL_TYPE_ACCESS
+    SQL_TYPE_ANSI
+End Enum
+
+Private Enum ERR_NUMBERS
+    ERR_TABLE_REQUIRED = 25000
+    ERR_LIST_REQUIRED = 25010
+    ERR_INVALID_VALUE = 25020
+    ERR_INVALID_LISTITEM = 25030
+    ERR_INVALID_CONNECTION = 25040
+End Enum
+
+Private Enum ObjectStateEnum
+    adStateClosed = 0
+    adStateOpen = 1
+    adStateConnecting = 2
+    adStateExecuting = 4
+    adStateFetching = 8
+End Enum
+
+Private Enum CursorType
+    adOpenDynamic = 2
+    adopenForwardOnly = 0
+    adOpenkeyset = 1
+    adOpenStatic = 3
+    adOpenUnspecified = -1
+End Enum
+
+Private Enum Locktype
+    adlockOptimistic = 3
+    adLockReadOnly = 1
+End Enum
+
+'///
+'/// Basic Error capturing for SQL genera
+'///
+
+Const ERR_TABLE_REQUIRED_DESC = "Table Name property must be set"
+Const ERR_LIST_REQUIRED_DESC = "Invalid argument; array or collection required."
+Const ERR_INVALID_VALUE_DESC = "Invalid argument type"
+Const ERR_INVALID_LISTITEM_DESC = "At least one element in the argument list is invalid"
+Const ERR_INVALID_CONNECTION_DESC = "Failed to connect to Database"
+
+Private colOrder As Collection
+Private colFields As Collection
+Private colValues As Collection 'for INSERT, UPDATE QUERIES
+
+Private colWhere As Collection
+
+Private strFrom As String
+
+Private strWhere As String
+
+Private strConnection As String
+Private strTableNames() As String
+Private strJoinTables As String
+Private strJoinFields As String
+Private joinOp As CLAUSE_OPERATOR
+Private JoinType_ As JOIN_TYPE
+
+Private whereLogic() As WHERE_CLAUSE_LOGIC
+Private blOrderByDesc() As Boolean
+
+Private StatementType_ As STATEMENT_TYPE
+Private SQLType_ As SQL_TYPE
+Private strSQL_ As String
+Private lastSQL_ As String
+Private strOrderClause As String
+
+Private blAutoQuote As Boolean
+Private blAutoLike As Boolean
+Private blAutoBracket As Boolean
+
+Private conn_ As Object
+Private rst_ As Object
+
+Private lastInsert_ As Long
+
+Const Delimiter = "@*"
+'
+Public Sub AddComplexWhereClause(ByVal Clause As String, Optional Logic As WHERE_CLAUSE_LOGIC = LOGIC_AND)
+    '///
+    '///  Used when more than a single where clause is required
+    '///
+    Dim i As Integer
+    i = UBound(whereLogic) + 1
+    ReDim Preserve whereLogic(i) As WHERE_CLAUSE_LOGIC
+    whereLogic(i) = Logic
+    colWhere.Add Clause
+End Sub
+
+Public Sub Connect(ByVal strDBServer As String, Optional ByVal strDB As String, Optional ByVal strUser As String, Optional ByVal strPassword As String)
+    
+    '///
+    '///    Connect to the database
+    '///
+    '///    Required Fields:
+    '///        strDBServer - SQL Server address or Access File Location
+    '///
+    '///    Optional Fields:
+    '///        strDB - Required Database for SQL connections only
+    '///        strUser - UserName (SQL Only) - If no user name is parsed assume trusted connection
+    '///        strPassword - Password for database if not a trusted connection
+    '///
+
+    
+    Dim objTemp As Object
+    'create connection if it doesnt already exist
+    If conn_ Is Nothing Then
+        Set objTemp = CreateObject("ADODB.Connection")
+        Set conn_ = objTemp
+        Set objTemp = Nothing
+        Set objTemp = CreateObject("ADODB.Recordset")
+        Set rst_ = objTemp
+        Set objTemp = Nothing
+    End If
+    
+    
+    'ensure that recordset is closed
+    If rst_.State = adStateOpen Then
+        rst_.Close
+    End If
+    
+    'if there is a currently open connection close it
+    If conn_.State = adStateOpen Then
+        conn_.Close
+    End If
+    
+    'Create appropriate connection string
+    If SQLType = SQL_TYPE_ANSI Or IsNull(SQL_TYPE_ANSI) Then
+        If strUser = "" Or IsNull(strUser) Then
+            strConnection = "Provider=SQLNCLI11;Server=" & strDBServer & ";Database=" & strDB & ";Trusted_Connection=yes;"
+        Else
+            strConnection = "Provider=SQLNCLI11;Server=" & strDBServer & ";Database=" & strDB & "; uid=" & strUser & ";pwd=" & strPassword & ";"
+        End If
+    Else
+        Set objTemp = CreateObject("Access.Application")
+        objTemp.Visible = False
+        objTemp.OpenCurrentDatabase strDBServer
+        
+        If objTemp.CurrentProject.FileFormat <= 10 Then
+            'Access 2003 and Below
+            If strPassword = "" Or IsNull(strUser) Then
+                strConnection = "Provider=Microsoft.Jet.OLEDB.4.0;Data Source=" & strDBServer & ";"
+            Else
+                strConnection = "Provider=Microsoft.Jet.OLEDB.4.0;Data Source=" & strDBServer & "; Jet OLEDB:Database Password=" & strPassword & ";"
+            End If
+        Else
+            'Access 2007 and above
+            If strPassword = "" Or IsNull(strUser) Then
+                strConnection = "Driver={Microsoft Access Driver (*.mdb, *.accdb)};Dbq=" & strDBServer & ";"
+            Else
+                strConnection = "Driver={Microsoft Access Driver (*.mdb, *.accdb)};Dbq=" & strDBServer & "; Pwd=" & strPassword & ";"
+            End If
+        End If
+        objTemp.Quit (2) ' quit access and do not save
+        objTemp.Visible = True
+        Set objTemp = Nothing
+    End If
+    
+    Conn.Open strConnection
+    
+    'raise error if not connected
+    If Not Conn.State = adStateOpen Then
+        Err.Raise ERR_INVALID_CONNECTION, , ERR_INVALID_CONNECTION
+    End If
+    
+End Sub
+
+Public Function EmptyRST() As Boolean
+
+    '///
+    '///    Checks to see if record set is empty or not
+    '///    Returns TRUE / FALSE
+    '///
+    
+    EmptyRST = True
+    If Not rst Is Nothing Then
+        'check for begining and end of record set
+        EmptyRST = ((rst.BOF) And (rst.ROF))
+    End If
+End Function
+
+Public Function Execute(Optional sSQL As String) As Boolean
+
+    '///
+    '///    Executes SQL statement
+    '///
+    '///    Optional sSQL - if is empty use last prepared sql statement
+    '///
+    '///    Returns True if executed and False if error
+    '///    does not determine if there was an error in SQL string
+    '///
+    
+    Dim tmpSQL As String
+    On Error GoTo errr
+    
+    'determine if sSQL is set
+    If sSQL <> "" And Not IsNull(sSQL) Then
+        tmpSQL = sSQL
+    Else
+        tmpSQL = strSQL_
+    End If
+    
+    'start execution
+     With Conn
+        
+        If StatementType = TYPE_SELECT Then
+            If rst_.State = adStateOpen Then
+                rst_.Close
+            End If
+            rst.ActiveConnection = conn_
+            rst.cursorLocation = 3 'adUseClient
+            rst.Open tmpSQL, , adOpenStatic, adLockReadOnly
+        Else
+            .BeginTrans
+            .Execute tmpSQL
+            .CommitTrans
+        End If
+        
+    End With
+    
+    'set last SQL statement
+    LastSQL = tmpSQL
+    Execute = True
+    Exit Function
+errr:
+    'cancel transaction if possible
+    Debug.Print tmpSQL
+    Debug.Print Err.Number; Err.Description
+    
+    On Error Resume Next
+    If Conn.State = adStateOpen Then
+        Conn.RollbackTrans
+    End If
+    Execute = False
+End Function
+
+Public Sub AddField(ByVal FieldName As String, Optional ByVal TableName As String)
+
+    '///
+    '///    add single field to fields collection and add square brackets [] if required
+    '///
+    '///    Required Fields
+    '///        Field Name - Name of field to be accessed
+    '///
+    '///    Optional Fields
+    '///        TableName - Name of table field belongs to. Used for complex SQL statements with JOINS
+    '///
+    
+    Dim strTable As String
+    Dim strField As String
+
+    If Len(TableName) Then
+        strTable = addBrackets(TableName) & "."
+    End If
+    strField = addBrackets(FieldName)
+    strField = strTable & strField
+
+    colFields.Add strField
+End Sub
+
+Public Sub AddFields(ParamArray args() As Variant)
+
+    '///
+    '///    add Multiple field(s) to fields collection and add square brackets [] if required
+    '///
+
+    Dim strSplit() As String
+    Dim i As Integer
+    Dim strField As String
+
+    For i = 0 To UBound(args)
+        If ValidateValues(args(i)) = False Then
+            Err.Raise ERR_INVALID_VALUE, , ERR_INVALID_VALUE_DESC
+        End If
+        strField = addBrackets(args(i))
+        colFields.Add strField
+    Next
+End Sub
+
+Public Sub AddOrderClause(ByVal FieldName As String, Optional OrderDesc = False, Optional ByVal TableName As String)
+    
+    '///
+    '///    add field to Order Collection, default sort is ascending
+    '///
+    '///    Required Fields
+    '///        FieldName - Name of field to be sorted
+    '///
+    '///    Optional Fields
+    '///        OrderDesc - Sort order of Field. Default is descending
+    '///        TableName - Name of table field belongs to. Used for complex SQL statements with JOINS
+    '///
+    
+    
+    
+    Dim i As Integer
+    Dim strField As String
+
+    i = UBound(blOrderByDesc) + 1
+    ReDim Preserve blOrderByDesc(i)
+    blOrderByDesc(i) = OrderDesc
+    If Len(TableName) Then strField = addBrackets(TableName) & "."
+    strField = strField & addBrackets(FieldName)
+    colOrder.Add strField
+End Sub
+
+Public Function AddWhereClause(ByVal FieldName As String, ByVal Value As Variant, Optional ByVal TableName As String, Optional op As CLAUSE_OPERATOR = CLAUSE_EQUALS, Optional Logic As WHERE_CLAUSE_LOGIC = LOGIC_AND) As String
+
+    
+    '///
+    '///    add field to Order Collection, default sort is ascending
+    '///
+    '///    Required Fields
+    '///        FieldName - Name of field
+    '///        Value - criteria of field
+    '///
+    '///    Optional Fields
+    '///        TableName - Name of table field belongs to. Used for complex SQL statements with JOINS
+    '///        op (CLAUSE_OPERATOR) - Type of operator e.g. equals, like, not equals
+    '///        logic (WHERE_CLAUSE_LOGIC) - Used if multiple where statements are required
+    '///
+    '///    Returns current where statement
+    '///
+    
+    
+    Dim i As Integer
+    Dim strField As String
+    Dim strWhereStatement As String
+    Dim blString As Boolean
+    Dim strValueClause As String
+
+    'validate values
+    If ValidateValues(Value) = False Then Err.Raise ERR_INVALID_VALUE, , ERR_INVALID_VALUE_DESC
+
+    i = UBound(whereLogic) + 1
+    ReDim Preserve whereLogic(i) As WHERE_CLAUSE_LOGIC
+    whereLogic(i) = Logic
+
+    blString = (VarType(Value) = vblString)
+
+    'table name is parsed add to field name
+    If Len(TableName) > 0 Then strWhereStatement = addBrackets(TableName) & "."
+    strWhereStatement = strWhereStatement & addBrackets(FieldName)
+    
+    'default operation to equals if not supplied
+    If Not blString And op = CLAUSE_LIKE Then
+        op = CLAUSE_EQUALS
+    End If
+    
+    'start generating Where statement
+    strWhereStatement = strWhereStatement & " " & TransformOp(op)
+
+    strValueClause = CStr(Value)
+
+    If op = CLAUSE_LIKE Then
+        If blAutoLike Then
+            strValueClause = LikeCharacter & strValueClause & LikeCharacter
+            If blAutoQuote Then strValueClause = prepStringForSQL(strValueClause)
+        Else
+            If blAutoQuote Then strValueClause = prepStringForSQL(strValueClause)
+        End If
+    ElseIf op = CLAUSE_STARTWITH Then
+        If blAutoLike Then
+            strValueClause = strValueClause & LikeCharacter
+            If blAutoQuote Then strValueClause = prepStringForSQL(strValueClause)
+        Else
+            If blAutoQuote Then strValueClause = prepStringForSQL(strValueClause)
+        End If
+    ElseIf op = CLAUSE_ENDWITH Then
+        If blAutoLike Then
+            strValueClause = LikeCharacter & strValueClause
+            If blAutoQuote Then strValueClause = prepStringForSQL(strValueClause)
+        Else
+            If blAutoQuote Then strValueClause = prepStringForSQL(strValueClause)
+        End If
+    Else
+        If blAutoQuote And blString Then strValueClause = prepStringForSQL(strValueClause)
+    End If
+
+    strValueClause = " " & strValueClause
+    strWhereStatement = strWhereStatement & strValueClause
+    colWhere.Add strWhereStatement 'add to where collection
+    
+    AddWhereClause = strWhereStatement
+
+End Function
+
+Public Sub AddTable(ByVal TableName As String)
+
+    '///
+    '///    add Table to Tables Collection
+    '///
+
+    Dim i As Integer
+    Dim strTableName As String
+
+    strTableName = addBrackets(TableName)
+
+    If Not TablePresent(strTableName) Then
+        i = UBound(strTableNames) + 1
+        ReDim Preserve strTableNames(i)
+        strTableNames(i) = strTableName
+    End If
+
+    'clear jointables and complex from
+    strFrom = ""
+    strJoinTables = ""
+    strJoinFields = ""
+    joinOp = CLAUSE_EQUALS 'default
+    JoinType = INNER_JOIN 'default
+    
+End Sub
+
+Public Sub AddValue(ByVal Value As Variant)
+
+    '///
+    '///    add Value to Value Collection
+    '///
+
+    Dim strReturn As String
+
+    If UCase(TypeName(Value)) = "FIELD" Then
+        Value = Value.Value
+    End If
+
+    If Not ValidateValues(Value) Then Err.Raise ERR_INVALID_VALUE, , ERR_INVALID_VALUE_DESC
+    If ValidateValues(Value) Then
+        strReturn = Value
+        If VarType(Value) = vbString And blAutoQuote Then
+            strReturn = prepStringForSQL(strReturn) 'add quotes to string
+        ElseIf VarType(Value) = vbDate And blAutoQuote Then
+            strReturn = prepDateForSQL(strReturn) 'preformat dates
+        End If
+        colValues.Add strReturn
+    End If
+End Sub
+
+Public Sub AddValues(ParamArray args() As Variant)
+    
+    '///
+    '///    add multiple Values to Value Collection
+    '///
+    
+    Dim strSplit() As String
+    Dim i As Integer
+    Dim strReturn As String
+
+    For i = 0 To UBound(args)
+        If ValidateValues(args(i)) = False Then
+            If UCase(TypeName(args(i))) = "FIELD" Then
+                args(i) = args(i).Value
+            End If
+            Err.Raise ERR_INVALID_VALUE, , ERR_INVALID_VALUE_DESC
+        End If
+    Next
+
+    For i = 0 To UBound(args)
+        strReturn = args(i)
+        If VarType(args(i)) = vbString And blAutoQuote Then strReturn = prepStringForSQL(strReturn)
+        colValues.Add strReturn
+    Next
+End Sub
+
+Public Sub ClearFromClause()
+    '///
+    '///    clear tables and joins
+    '///
+    strFrom = ""
+    strJoinTables = ""
+    strJoinFields = ""
+    JoinType = INNER_JOIN
+    joinOp = CLAUSE_EQUALS
+    ReDim strTableNames(0) As String
+End Sub
+
+Public Sub ClearWhereClause()
+
+    '///
+    '///    Clear Where Collection
+    '///
+    
+    Set colWhere = New Collection
+    ReDim whereLogic(0) As WHERE_CLAUSE_LOGIC
+End Sub
+
+Public Sub ClearOrderClause()
+    
+    '///
+    '///    Clear Order Collection
+    '///
+    
+    Set colOrder = New Collection
+    ReDim blOrderByDesc(0) As Boolean
+End Sub
+
+Public Sub ClearFields()
+    '///
+    '///    Clear Fields Collection
+    '///
+    Set colFields = New Collection
+End Sub
+
+Public Sub ClearValues()
+    '///
+    '///    Clear Values Collection
+    '///
+    Set colValues = New Collection
+End Sub
+
+Public Sub ListAddFields(ByVal FieldList As Variant, Optional ByVal TableName As String)
+
+    '///
+    '///  Add fields based on parsed collection of field names
+    '///
+
+    Dim blValid As Boolean
+    Dim blCollection As Boolean
+    Dim strReturn As String
+    Dim l As Long
+    Dim v As Variant
+    Dim strItem As String
+    Dim lngStartPoint As Long
+
+    If IsObject(FieldList) Then
+        blValid = (TypeOf FieldList Is Collection)
+        blCollection = True
+    Else
+        blValid = IsArray(FieldList)
+    End If
+
+    If Not blValid Then
+        Err.Raise ERR_LIST_REQUIRED, , ERR_LIST_REQUIRED_DESC
+        Exit Sub
+    End If
+
+    'optional: add type check for each value in array or collection
+    'can't have objects,
+
+    If blCollection Then
+        For Each v In FieldList
+            If Not ValidateValues(v) Then Err.Raise ERR_INVALID_LISTITEM, , ERR_INVALID_LISTITEM_DESC
+            If Len(v) > 0 Then
+                If Len(TableName) Then
+                    strReturn = addBrackets(TableName) & "."
+                End If
+
+                strItem = Trim(CStr(v))
+                strReturn = strReturn & addBrackets(strItem)
+
+                colFields.Add strReturn
+                strReturn = ""
+            End If 'len(v)
+        Next v
+    Else
+        On Error Resume Next
+        v = FieldList(0)
+        lngStartPoint = IIf(Err.Number = 0, 0, 1)
+        Err.Clear
+
+        On Error GoTo 0
+
+        For l = lngStartPoint To UBound(FieldList)
+            strReturn = ""
+            If Not ValidateValues(FieldList(l)) Then Err.Raise ERR_INVALID_LISTITEM, , ERR_INVALID_LISTITEM_DESC
+                If Len(FieldList(l)) > 0 Then
+                If Len(TableName) Then
+                    strReturn = strReturn & addBrackets(TableName) & "."
+                End If
+                strReturn = strReturn & addBrackets(FieldList(l))
+                colFields.Add strReturn
+            End If 'len(FieldList(l) > 0
+        Next
+    End If 'blCollection
+End Sub
+
+Public Sub ListAddValues(ByVal ValueList As Variant)
+    
+    '///
+    '///  Add values based on parsed collection of values
+    '///
+    
+    Dim blValid As Boolean
+    Dim blCollection As Boolean
+    Dim strReturn As String
+    Dim l As Long
+    Dim strSplit() As String
+    Dim i As Integer
+    Dim strTest As String
+    Dim lngStart As Long
+    Dim v As Variant
+    Dim lngStartPoint As Long
+
+    'PURPOSE: ADD A list of values to the values collection
+    'Values are for Update or Insert queries
+    'The List can be either an array or a collection
+
+    If IsObject(ValueList) Then
+        If TypeOf ValueList Is Collection Then
+            blValid = True
+        Else
+            blValid = False
+        End If
+        blCollection = True
+    Else
+        blValid = IsArray(ValueList)
+    End If
+
+    If Not blValid Then
+        Err.Raise ERR_LIST_REQUIRED, , ERR_LIST_REQUIRED_DESC
+        Exit Sub
+    End If
+
+    If blCollection Then
+        For Each v In ValueList
+            If Not ValidateValues(v) Then Err.Raise ERR_INVALID_LISTITEM, , ERR_INVALID_LISTITEM_DESC
+            If VarType(v) <> vblString Or Not blAutoQuote Then
+                colValues.Add v
+            Else
+                colValues.Add prepStringForSQL(CStr(v))
+            End If
+        Next
+    Else
+        'Determine if we are dealing with 0 or 1 bound arrays
+        Err.Clear
+        On Error Resume Next
+        strTest = ValueList(0)
+        lngStartPoint = IIf(Err.Number = 0, 0, 1)
+        Err.Clear
+
+        On Error GoTo 0
+
+        For l = lngStartPoint To UBound(ValueList)
+            If Not ValidateValues(ValueList(l)) Then Err.Raise ERR_INVALID_LISTITEM, , ERR_INVALID_LISTITEM_DESC
+            strReturn = ""
+            If VarType(ValueList(l)) <> vblString Or Not blAutoQuote Then
+                colValues.Add ValueList(l)
+            Else
+                colValues.Add prepStringForSQL(CStr(ValueList(l)))
+            End If
+        Next
+    End If
+End Sub
+
+Public Sub Reset()
+    '///
+    '///    reset all collections
+    '///
+    ClearFromClause
+    ClearWhereClause
+    ClearOrderClause
+    ClearFields
+    ClearValues
+    'key for field, value for value
+    StatementType = TYPE_SELECT 'default
+End Sub
+
+Public Sub SetupJoin(ByVal Table1 As String, ByVal Field1 As String, ByVal Table2 As String, ByVal Field2 As String, Optional op As CLAUSE_OPERATOR = CLAUSE_EQUALS, Optional JoinType As JOIN_TYPE)
+    
+    
+    '///
+    '///    Sets up Join Clauses
+    '///
+    '///    Required Fields
+    '///        Table1, Table2 = Two tables which form part of the Join
+    '///        Field1, Field2 = the two fields which need to match
+    '///
+    '///    Optional Fields
+    '///        op (CLAUSE_OPERATOR) - Type of operator e.g. equals, like, not equals. Default is equals
+    '///        JoinType (JOIN_TYPE) - Type of Join type required. Default is INNER_JOIN
+    '///
+    
+    
+
+    Dim strTable1 As String, strTable2 As String
+    Dim strField1 As String, strField2 As String
+
+    'addbrackes and join fields with tables
+    strTable1 = addBrackets(Table1)
+    strTable2 = addBrackets(Table2)
+    strField1 = addBrackets(Field1)
+    strField2 = addBrackets(Field2)
+
+    strJoinTables = strTable1 & Delimiter & strTable2
+    strJoinFields = strField1 & Delimiter & strField2
+    
+    joinOp = op
+    
+    'determine Join Type
+    Select Case JoinType
+        Case Is <= 0, Is > FULL_JOIN
+            If JoinType = 0 Then JoinType = INNER_JOIN
+        Case FULL_JOIN
+            JoinType = IIf(SQLType = SQL_TYPE_ANSI, FULL_JOIN, IIf(JoinType = 0, INNER_JOIN, JoinType))
+        Case Else
+            JoinType = JoinType
+    End Select
+
+    'reset other from related options
+    ReDim strTableNames(0) As String
+    strFrom = ""
+End Sub
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+'
+' Setters and Getters
+'
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+Private Property Let Conn(ByVal con As Object)
+    Set conn_ = con
+End Property
+
+Private Property Get Conn() As Object
+    Set Conn = conn_
+End Property
+
+Private Property Let rst(ByVal rec As Object)
+    Set rst_ = rec
+End Property
+
+Public Property Get rst() As Object
+    Set rst = rst_
+End Property
+
+Private Property Get LastSQL() As String
+    LastSQL = lastSQL_
+End Property
+
+Public Property Let LastSQL(ByVal sSQL As String)
+    lastSQL_ = sSQL
+End Property
+
+Public Property Get AutoBracket() As Boolean
+    AutoBracket = blAutoBracket
+End Property
+Public Property Let AutoBracket(ByVal NewValue As Boolean)
+    blAutoBracket = NewValue
+End Property
+
+Public Property Get AutoLike() As Boolean
+    AutoLike = blAutoLike
+End Property
+Public Property Let AutoLike(ByVal NewValue As Boolean)
+    blAutoLike = NewValue
+End Property
+
+Public Property Get AutoQuote() As Boolean
+    AutoQuote = blAutoQuote
+End Property
+Public Property Let AutoQuote(ByVal NewValue As Boolean)
+    blAutoQuote = NewValue
+End Property
+
+Public Property Let ComplexFromClause(ByVal NewValue As String)
+'reset everything else
+Dim sWkg As String
+Dim strSplit() As String
+
+sWkg = Trim$(NewValue)
+
+If Left$(NewValue, 4) = "FROM" Then
+strSplit = Split(sWkg, "FROM")
+strFrom = Trim$(strSplit(1))
+Else
+strFrom = sWkg
+End If
+
+'reset to defaults
+ReDim strTableNames(0) As String
+
+    strJoinTables = ""
+strJoinFields = ""
+joinOp = CLAUSE_EQUALS
+JoinType = INNER_JOIN
+End Property
+Public Property Get ComplexFromClause() As String
+    ComplexFromClause = strFrom
+End Property
+
+Public Property Get JoinType() As JOIN_TYPE
+    JoinType = JoinType_
+End Property
+Public Property Let JoinType(ByVal NewValue As JOIN_TYPE)
+    If NewValue >= INNER_JOIN And NewValue <= FULL_JOIN Then
+        If NewValue = FULL_JOIN And SQLType = SQL_TYPE_ACCESS And JoinType = 0 Then
+            JoinType_ = INNER_JOIN
+        Else
+            JoinType_ = NewValue
+        End If
+    End If
+End Property
+
+Public Property Get StatementType() As STATEMENT_TYPE
+    StatementType = StatementType_
+End Property
+Public Property Let StatementType(ByVal NewValue As STATEMENT_TYPE)
+    StatementType_ = IIf(NewValue <= TYPE_DELETE, NewValue, TYPE_SELECT)
+End Property
+
+Public Property Get SQLType() As SQL_TYPE
+    SQLType = SQLType_
+End Property
+Public Property Let SQLType(ByVal NewValue As SQL_TYPE)
+    If NewValue = SQL_TYPE_ACCESS Or NewValue = SQL_TYPE_ANSI Then
+        SQLType_ = NewValue
+    End If
+End Property
+
+Public Property Get sql() As String
+    MakeStatement
+    sql = strSQL_
+End Property
+
+Private Property Let sql(ByVal sSQL As String)
+    strSQL_ = sSQL
+End Property
+
+Public Property Get LastInsert() As Long
+    LastInsert = lastInsert_
+End Property
+
+Public Property Get TableCount() As Long
+Dim lngReturn As Long
+If strTableNames(0) = "" And UBound(strTableNames) = 0 Then
+TableCount = ComplexTableCount
+Else
+TableCount = UBound(strTableNames)
+End If
+End Property
+
+Private Property Get LikeCharacter() As String
+    LikeCharacter = IIf(SQLType = SQL_TYPE_ACCESS, "*", "%")
+End Property
+
+Public Sub MakeStatement()
+
+    '///
+    '///    Generates Complex SQL Statement
+    '///
+    
+    Dim strReturn As String
+    Dim strWhereClause As String
+    Dim sOrderClause As String
+    Dim sJoinClause As String
+    Dim sCommand As String
+    Dim i As Integer
+    Dim sOp As String
+    Dim strTemp As String
+    Dim strSplitTables() As String
+    Dim strSplitFields() As String
+    Dim lUpLimit As Long
+
+    Select Case StatementType
+        Case TYPE_SELECT ' Select Queries
+            If UBound(strTableNames) > 0 Or strJoinTables <> "" Or strFrom <> "" Then
+                sCommand = "SELECT "
+                If colFields.Count = 0 Then
+                    sCommand = sCommand & "* "
+                Else
+                    'Loop Through Fields
+                    For i = 1 To colFields.Count
+                        sCommand = sCommand & colFields(i)
+                        If i <> colFields.Count Then sCommand = sCommand & ","
+                        sCommand = sCommand & " "
+                    Next
+                End If
+                sCommand = sCommand & "FROM "
+                'Add Tables
+                On Error Resume Next
+                If Len(strFrom) > 0 Then
+                    sCommand = sCommand & strFrom
+                Else
+                    If UBound(strTableNames) >= 1 Then
+                        For i = 1 To UBound(strTableNames)
+                            sCommand = sCommand & strTableNames(i)
+                            If i <> UBound(strTableNames) Then sCommand = sCommand & ", "
+                        Next
+                    Else
+                        strSplitTables = Split(strJoinTables, Delimiter)
+                        strSplitFields = Split(strJoinFields, Delimiter)
+                        sCommand = sCommand & strSplitTables(0)
+                        sCommand = sCommand & " "
+                        'FIX TO DEAL WITH JOIN TYPES
+                        If JoinType < 1 Or JoinType > 4 Then JoinType = INNER_JOIN
+                        Select Case JoinType
+                            Case INNER_JOIN
+                                If SQLType = SQL_TYPE_ACCESS Then sCommand = sCommand & "INNER "
+                            Case LEFT_JOIN
+                                sCommand = sCommand & " LEFT "
+                            Case RIGHT_JOIN
+                                sCommand = sCommand & " RIGHT "
+                            Case FULL_JOIN
+                                sCommand = sCommand & IIf(SQLType = SQL_TYPE_ACCESS, " INNER ", " FULL ")
+                        End Select
+                        sCommand = sCommand & "JOIN " & strSplitTables(1) & " ON "
+                        If InStr(strSplitFields(0), ".") > 0 Then
+                            sCommand = sCommand & strSplitFields(0)
+                        Else
+                            sCommand = sCommand & strSplitTables(0) & "." & strSplitFields(0)
+                        End If
+                        sCommand = sCommand & " " & TransformOp(joinOp) & " "
+                        If InStr(strSplitFields(1), ".") > 0 Then
+                            sCommand = sCommand & strSplitFields(1)
+                        Else
+                            sCommand = sCommand & strSplitTables(1) & "." & strSplitFields(1)
+                        End If
+                    End If
+                End If
+            End If
+        Case TYPE_INSERT ' Insert Queries
+            
+            If Trim(strTableNames(1)) = "" Then
+                Err.Raise ERR_TABLE_REQUIRED, , ERR_TABLE_REQUIRED_DESC
+                Exit Sub
+            End If
+            'Add Tables
+            sCommand = "INSERT INTO " & strTableNames(1)
+            'Add fields
+            If colFields.Count > 0 Then
+                sCommand = sCommand & " ("
+                For i = 1 To colFields.Count
+                    sCommand = sCommand & colFields(i)
+                    If i <> colFields.Count Then sCommand = sCommand & ", "
+
+                Next
+                sCommand = sCommand & ")"
+            End If
+            'Add values
+            If colValues.Count > 0 Then
+                sCommand = sCommand & " VALUES ("
+                For i = 1 To colValues.Count
+                    sCommand = sCommand & colValues(i)
+                    If i <> colValues.Count Then sCommand = sCommand & ", "
+                Next
+                sCommand = sCommand & ")"
+            End If
+        Case TYPE_UPDATE 'Update Queries
+            If colFields.Count > 0 And colValues.Count > 0 And strTableNames(1) <> "" Then
+                lUpLimit = IIf(colFields.Count > colValues.Count, colValues.Count, colFields.Count)
+                sCommand = "UPDATE " & strTableNames(1) & " SET " ' add table Name
+                For i = 1 To lUpLimit
+                    sCommand = sCommand & colFields(i) & " = " & colValues(i)
+                    If i <> lUpLimit Then sCommand = sCommand & ", "
+                Next
+            End If
+        Case TYPE_DELETE 'delete Queries
+            If strTableNames(1) <> "" Then
+                sCommand = "DELETE FROM " & strTableNames(1) 'add tablename
+            End If
+    End Select
+
+    'Append Where Clause
+
+    If StatementType <> TYPE_INSERT And sCommand <> "" Then
+        For i = 1 To colWhere.Count
+            If i = 1 Then
+                strWhereClause = "WHERE"
+            Else
+                strWhereClause = strWhereClause & IIf(whereLogic(i) = LOGIC_AND, " AND", " OR")
+            End If
+            strWhereClause = strWhereClause & " (" & colWhere.Item(i) & ")"
+        Next
+    End If
+
+    'Append Order Clause
+    If StatementType = TYPE_SELECT Then
+        For i = 1 To colOrder.Count
+            If i = 1 Then sOrderClause = "ORDER BY "
+            sOrderClause = sOrderClause & colOrder.Item(i)
+            If blOrderByDesc(i) = True Then sOrderClause = sOrderClause & " DESC"
+            If i <> colOrder.Count Then sOrderClause = sOrderClause & ", "
+        Next
+    End If
+    
+    strReturn = sCommand
+    If Len(strWhereClause) > 0 Then strReturn = strReturn & " " & strWhereClause
+    If Len(sOrderClause) > 0 Then strReturn = strReturn & " " & sOrderClause
+    strOrderClause = sOrderClause
+    sql = strReturn
+End Sub
+
+Private Function DistinctValues(ByVal InputArray As Variant) As String()
+    
+    '///
+    '///    Exports the distinct values of a collection as a string
+    '///
+    '///
+    
+    Dim astrReturn() As String
+    Dim lngStartPoint As Long
+    Dim lEndPoint As Long
+    Dim lCount As Long
+    Dim col As New Collection
+    Dim l As Long
+    Dim strTest As Variant
+
+    ReDim astrReturn(0) As String
+
+    lCount = UBound(InputArray)
+
+    On Error Resume Next
+    strTest = InputArray(0)
+    lngStartPoint = IIf(Err.Number = 0, 0, 1)
+    Err.Clear
+
+    For l = lngStartPoint To lCount
+        col.Add 0, InputArray(l)
+        If Err.Number = 0 Then
+            If astrReturn(0) = "" Then
+                astrReturn(0) = InputArray(l)
+            Else
+                ReDim Preserve astrReturn(UBound(astrReturn) + 1) As String
+                astrReturn(UBound(astrReturn)) = InputArray(l)
+            End If
+        End If
+        Err.Clear
+    Next
+    DistinctValues = astrReturn
+End Function
+
+Private Function addBrackets(ByVal DBObjectName As String) As String
+
+    '///
+    '///    Brackets to either field or tablenames
+    '///
+    '///    Returns the result
+    '///
+
+    Dim strSplit() As String
+    Dim strReturn As String
+    Dim i As Integer
+
+    If InStr(DBObjectName, ".") > 0 Then
+        strSplit = Split(DBObjectName, ".")
+        For i = 0 To UBound(strSplit)
+            If InStr(strSplit(i), " ") > 0 And InStr(strSplit(i), "(") = 0 And InStr(strSplit(i), ")") = 0 And InStr(strSplit(i), "[") = 0 And blAutoBracket Then
+                strReturn = strReturn & "[" & strSplit(i) & "]"
+            Else
+                strReturn = strReturn & Trim(strSplit(i))
+            End If
+
+            If i < UBound(strSplit) Then strReturn = strReturn & "."
+        Next
+    Else
+        strReturn = Trim(DBObjectName)
+        If InStr(strReturn, " ") > 0 And InStr(strReturn, "(") = 0 And Left$(strReturn, 1) <> "[" And blAutoBracket Then
+            strReturn = "[" & strReturn & "]"
+        End If
+    End If
+
+    addBrackets = strReturn
+End Function
+
+Public Function prepDateForSQL(ByVal vDate As Variant, Optional vType As SQLDateTypes = sqlDateAndTime) As String
+    
+    
+    '///
+    '///    Prepares dates to be us in SQL Queries
+    '///
+    '///    Requied Field
+    '///        vDate = Date to be prepared
+    '///
+    '///    Optional Field
+    '///        vType (SQLDateTypes) = Type of date/time to be returned i.e. dd/mm/yyyy or hh:mm:ss or dd/mm/yyyy hh:mm:ss
+    '///
+    '///    returns prepared date
+    '///
+    
+    On Error GoTo LocalError
+
+    'Remove all invalid characters
+    vDate = Trim(CStr(vDate))
+    vDate = Replace(vDate, "#", "")
+    vDate = Replace(vDate, "'", "")
+    vDate = Replace(vDate, Chr(34), "")
+
+    prepDateForSQL = ""
+
+    'First see in what format the data came
+    If Not IsDate(vDate) Or IsNull(vDate) Then
+        'could be a number
+        If IsNumeric(vDate) Then
+            vDate = CDate(vDate)
+        End If
+        If Not IsDate(vDate) Then
+            'Still not a date
+            Exit Function
+        End If
+    End If
+
+    'Valid if we get this far
+    Dim lDelim As String
+
+    lDelim = IIf(SQL_TYPE_ANSI, "", "#")
+    If vType = sqlDateOnly Then 'return Date
+        prepDateForSQL = IIf(SQL_TYPE_ANSI, Format(vDate, "dd\/mm\/yyyy"), FormatDateTime(vDate, vbShortDate))
+    ElseIf vType = sqlTimeOnly Then 'return time
+        prepDateForSQL = IIf(SQL_TYPE_ANSI, Format(vDate, "hh\:mm\:ss"), Format(vDate, "hh\:mm\:ss"))
+    ElseIf vType = sqlXMLDateAndTime Then
+        prepDateForSQL = Format(vDate, "yyyy-MM-ddThh\:mm\:ss")
+        
+    'Return Date and Time
+        prepDateForSQL = IIf(SQL_TYPE_ANSI, Format(vDate, "yyyy\/MM\/dd hh\:mm\:ss"), FormatDateTime(vDate, vbShortDate) & " " & Format(vDate, "hh\:mm\:ss"))
+    End If
+
+    prepDateForSQL = lDelim & prepDateForSQL & lDelim
+
+    Exit Function
+
+LocalError:
+    prepDateForSQL = ""
+End Function
+
+Private Function prepStringForSQL(ByVal strReturn As String) As String
+    '///
+    '///    Prepares Strings to be us in SQL Queries
+    '///
+    '///    escapes quoatation marks in string and and single quotes to begining and end of string
+    '///    returns final result
+    '///
+    strReturn = Replace(strReturn, Chr(39), "''")
+    strReturn = "'" & strReturn & "'"
+    prepStringForSQL = strReturn
+End Function
+
+Private Function ComplexTableCount() As Long
+    
+    '///
+    '///    Returns the number of tables used in a complex join
+    '///
+
+
+    Dim strSplit() As String
+    Dim strSplit2() As String
+
+    Dim strInput As String
+    Dim strTables() As String
+    
+    Dim i As Integer
+
+    Dim vUnique As Variant
+    Dim lngReturn As Long
+
+    If strFrom <> "" Then
+        strSplit = Split(strFrom, " ")
+        ReDim strTables(0) As String
+        strTables(0) = strSplit(0)
+
+        strSplit = Split(strFrom, "JOIN")
+
+        For i = 1 To UBound(strSplit)
+            strSplit2 = Split(Trim$(strSplit(i)), " ")
+            ReDim Preserve strTables(UBound(strTables) + 1)
+            strTables(UBound(strTables)) = strSplit2(0)
+        Next
+
+        vUnique = DistinctValues(strTables)
+
+        lngReturn = UBound(vUnique) + 1
+    ElseIf Trim$(strJoinTables) <> "" Then
+        strSplit = Split(strJoinTables, Delimiter)
+        vUnique = DistinctValues(strSplit)
+        lngReturn = UBound(vUnique) + 1
+    End If
+
+    ComplexTableCount = lngReturn
+End Function
+
+Private Function TablePresent(TableName As String) As Boolean
+
+    '///
+    '///    Checks to see if tablename already exists in Array
+    '///
+    '///    Returns TRUE or FALSE
+    '///
+
+    Dim i As Integer
+    Dim blReturn As Boolean
+
+    If UBound(strTableNames) = 0 Then Exit Function
+
+    For i = 1 To UBound(strTableNames)
+        If TableName = strTableNames(i) Then blReturn = True
+    Next
+    TablePresent = blReturn
+End Function
+
+Private Function TransformOp(op As CLAUSE_OPERATOR) As String
+    Dim strOperation As String
+    
+    '///
+    '/// Returns enum values as SQL equivalent strings
+    '///
+
+    Select Case op
+        Case CLAUSE_EQUALS
+            strOperation = "="
+        Case CLAUSE_LIKE
+            strOperation = "LIKE"
+        Case CLAUSE_STARTWITH
+            strOperation = "LIKE"
+        Case CLAUSE_ENDWITH
+            strOperation = "LIKE"
+        Case CLAUSE_GREATERTHAN
+            strOperation = ">"
+        Case CLAUSE_LESSTHAN
+            strOperation = "<"
+        Case CLAUSE_GREATERTHANOREQUAL
+            strOperation = ">="
+        Case CLAUSE_LESSTHANOREQUAL
+            strOperation = "<="
+        Case CLAUSE_DOESNOTEQUAL
+            strOperation = "<>"
+        Case Else
+            strOperation = "="
+    End Select
+    TransformOp = strOperation
+End Function
+
+Private Function ValidateValues(Values As Variant) As Boolean
+    
+    '///
+    '///    Checks to see if passed values are Not an Object, Error, Array or Userdefined Type
+    '///
+    
+    Dim blCollection As Boolean
+    Dim errorTypes(4) As Integer
+    Dim v As Variant
+    Dim intErrorTypes As Integer
+    Dim lngCtr As Long
+    Dim lngCount As Long
+    Dim lngStartPoint As Long
+    Dim i As Integer
+
+    Dim blReturn As Boolean
+
+    errorTypes(0) = vbObject
+    errorTypes(1) = vbError
+    errorTypes(2) = vbDataObject
+    errorTypes(3) = vbUserDefinedType
+    errorTypes(4) = vbArray
+
+    blReturn = True
+    intErrorTypes = UBound(errorTypes)
+
+    If IsObject(Values) Then
+        If Not TypeOf Values Is Collection Then
+            ValidateValues = False
+            Exit Function
+        End If
+    Else
+        If Not VarType(Values) = vbArray Then
+            For i = 0 To intErrorTypes
+                If VarType(Values) = errorTypes(i) Then
+                    blReturn = False
+                    Exit For
+                End If
+            Next
+            ValidateValues = blReturn
+            Exit Function
+        End If
+    End If
+
+    blCollection = IsObject(Values) 'has to be collection
+
+    If blCollection Then
+        For Each v In Values
+            For i = 1 To intErrorTypes
+                If VarType(v) = errorTypes(i) Or VarType(v) = errorTypes(i) + vbVariant Then 'if object is other than string return false
+                    blReturn = False
+                    Exit For
+                End If
+            Next
+            If blReturn = False Then Exit For
+        Next
+    Else
+        lngCount = UBound(Values)
+        On Error Resume Next
+        v = Values(0)
+        lngStartPoint = IIf(Err.Number = 0, 0, 1)
+        Err.Clear
+        On Error GoTo 0
+        For lngCtr = lngStartPoint To lngCount
+            For i = 1 To intErrorTypes
+                If VarType(Values(lngCtr)) = errorTypes(i) Or VarType(v) = errorTypes(i) + vbVariant Then
+                    blReturn = False
+                    Exit For
+                End If
+            Next
+            If blReturn = False Then Exit For
+        Next
+    End If
+
+    ValidateValues = blReturn
+End Function
+
+
+Private Sub Class_Initialize()
+    '///
+    '///    Initializes class and sets defaults
+    '///
+    Reset
+    blAutoLike = True
+    blAutoQuote = True
+    SQLType = SQL_TYPE_ACCESS
+    blAutoBracket = True
+End Sub
